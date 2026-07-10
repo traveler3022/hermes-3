@@ -145,6 +145,10 @@ data class ChatUiState(
     // Files/images staged on the gateway, waiting to go with the next prompt
     val pendingAttachments: List<PendingAttachment> = emptyList(),
     val isAttaching: Boolean = false,
+    // Human-readable progress for a large attachment being split into
+    // parts (e.g. "Uploading part 3/8…"). Null outside that path — small
+    // attachments finish in one call with no visible steps to report.
+    val attachProgress: String? = null,
     // Agent's live task list for the current turn (empty = no plan to show)
     val activeTodos: List<TodoItemUi> = emptyList(),
     // Reasoning effort (agent.reasoning_effort) — quick-switchable from the

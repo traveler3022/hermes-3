@@ -158,6 +158,7 @@ internal fun InputBar(
     text: String,
     isSending: Boolean,
     isAttaching: Boolean = false,
+    attachProgress: String? = null,
     pendingAttachments: List<PendingAttachment> = emptyList(),
     slashCommands: List<SlashCommandSuggestion>,
     onTextChange: (String) -> Unit,
@@ -208,6 +209,26 @@ internal fun InputBar(
                         label = { Text(cmd.command) },
                     )
                 }
+            }
+        }
+        // Multi-part uploads (large files) take real time over mobile data —
+        // a bare spinner for a whole minute-plus sequence reads as broken.
+        // This is the same information the "+" button's spinner represents,
+        // just with the actual step visible instead of a black box.
+        if (attachProgress != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                Text(
+                    text = attachProgress,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
         // Staged attachments — already uploaded to the gateway, sent with the

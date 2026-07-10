@@ -617,6 +617,7 @@ class ChatViewModel @Inject constructor(
                 _uiState.update { it.copy(
                     errorEvent = ErrorEvent.Error("Attach failed: ${e.message}"),
                     isAttaching = false,
+                    attachProgress = null,
                 ) }
             }
         }
@@ -653,15 +654,27 @@ class ChatViewModel @Inject constructor(
         return b64.toString()
     }
 
+    /** Transient per-part upload failures (a dropped mobile connection
+     *  mid-sequence is the realistic case, not a corrupt file) get retried
+     *  before giving up on the whole attachment. */
+    private val partRetryCount = 2
+    private val partRetryDelayMs = 1500L
+
     /**
      * Upload a file too large for a single WebSocket frame by splitting it
      * into sequential [singlePartMaxBytes]-sized parts, each sent as its
      * own `file.attach` call (same RPC the small-file path uses — no server
      * changes needed). The prompt text gets a `cat`-and-verify instruction
      * instead of a single `@file:` ref, so the agent reassembles the parts
-     * into the original filename before treating it as the actual
-     * attachment. Requires the agent to have shell access to its own
-     * workspace, which it already does for every other file-producing tool.
+     * into the original filename — and confirms the reassembled size
+     * matches before treating it as the actual attachment, so a silently
+     * incomplete `cat` doesn't get used as if it were the real file.
+     * Requires the agent to have shell access to its own workspace, which
+     * it already does for every other file-producing tool.
+     *
+     * Reports progress via [ChatUiState.attachProgress] as each part
+     * uploads — an 8-part sequence over mobile data takes real time, and a
+     * silent spinner for that whole span reads as broken, not slow.
      */
     private suspend fun attachLargeFile(
         sessionId: String,
@@ -675,34 +688,63 @@ class ChatViewModel @Inject constructor(
         val partRefs = mutableListOf<String>()
         val partNames = mutableListOf<String>()
         for (partIndex in 0 until partCount) {
+            val partLabel = "${partIndex + 1}/$partCount"
+            _uiState.update { it.copy(attachProgress = "Uploading $name — part $partLabel…") }
+
             val start = partIndex.toLong() * singlePartMaxBytes
             val length = minOf(singlePartMaxBytes.toLong(), totalSize - start)
             val partName = "$name.part${(partIndex + 1).toString().padStart(3, '0')}of" +
                 partCount.toString().padStart(3, '0')
-            val b64 = encodeUriToBase64(resolver, uri, rangeStart = start, rangeLength = length)
-            val params = buildJsonObject {
-                put("session_id", sessionId)
-                put("data_url", "data:application/octet-stream;base64,${b64}")
-                put("name", partName)
+
+            var attempt = 0
+            var lastError: Exception? = null
+            var ref: String? = null
+            while (attempt <= partRetryCount && ref == null) {
+                if (attempt > 0) {
+                    _uiState.update { it.copy(attachProgress = "Retrying $name — part $partLabel (attempt ${attempt + 1})…") }
+                    delay(partRetryDelayMs)
+                }
+                try {
+                    val b64 = encodeUriToBase64(resolver, uri, rangeStart = start, rangeLength = length)
+                    val params = buildJsonObject {
+                        put("session_id", sessionId)
+                        put("data_url", "data:application/octet-stream;base64,${b64}")
+                        put("name", partName)
+                    }
+                    val result = gatewayClient.request("file.attach", jsonToElementMap(params))
+                    ref = ((result as? JsonObject)?.get("ref_text") as? JsonPrimitive)?.content
+                        ?: throw IllegalStateException("Gateway returned no file reference for part $partLabel")
+                } catch (e: Exception) {
+                    lastError = e
+                    Timber.w(e, "[Chat] Part $partLabel of $name failed (attempt ${attempt + 1})")
+                }
+                attempt++
             }
-            val result = gatewayClient.request("file.attach", jsonToElementMap(params))
-            val ref = ((result as? JsonObject)?.get("ref_text") as? JsonPrimitive)?.content
-                ?: throw IllegalStateException("Gateway returned no file reference for part ${partIndex + 1}/$partCount")
+            if (ref == null) {
+                throw IllegalStateException(
+                    "Part $partLabel of $name failed after ${attempt} attempt(s): ${lastError?.message}",
+                    lastError,
+                )
+            }
             partRefs.add(ref)
             partNames.add(partName)
-            Timber.i("[Chat] Attached part ${partIndex + 1}/$partCount of $name (${length} bytes)")
+            Timber.i("[Chat] Attached part $partLabel of $name ($length bytes)")
         }
+        _uiState.update { it.copy(attachProgress = null) }
 
         // One instruction block, not N separate attachment lines — tells
-        // the agent these parts are one file, in order, and exactly how to
-        // rebuild it before doing anything else with it.
+        // the agent these parts are one file, in order, exactly how to
+        // rebuild it, and how to confirm the rebuild actually matches the
+        // original size before trusting it (a `cat` that silently drops a
+        // part still exits 0 — checking the byte count catches that).
         val instruction = buildString {
             append("The following $partCount file parts together make up \"$name\" ")
-            append("(${totalSize / (1024 * 1024)} MB total, mime type $mime). ")
-            append("Before using this file, reassemble it in order, e.g.:\n")
+            append("($totalSize bytes total, mime type $mime). ")
+            append("Before using this file, reassemble and verify it, e.g.:\n")
             append("cat ")
             append(partNames.joinToString(" ") { "\"$it\"" })
-            append(" > \"$name\"\n")
+            append(" > \"$name\" && [ \"\$(wc -c < \"$name\")\" -eq $totalSize ] ")
+            append("&& echo REASSEMBLY_OK || echo REASSEMBLY_SIZE_MISMATCH\n")
             partRefs.forEach { append(it).append('\n') }
         }
         return PendingAttachment(name = name, isImage = false, refText = instruction)

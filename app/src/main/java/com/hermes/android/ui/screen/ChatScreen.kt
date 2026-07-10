@@ -855,6 +855,7 @@ fun ChatScreen(
                     text = uiState.inputText,
                     isSending = uiState.isSending,
                     isAttaching = uiState.isAttaching,
+                    attachProgress = uiState.attachProgress,
                     pendingAttachments = uiState.pendingAttachments,
                     slashCommands = slashCommands,
                     onTextChange = viewModel::updateInputText,
