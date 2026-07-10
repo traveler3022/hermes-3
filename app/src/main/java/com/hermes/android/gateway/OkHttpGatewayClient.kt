@@ -122,7 +122,21 @@ class OkHttpGatewayClient @Inject constructor(
         }
 
         return try {
-            connectDeferred.await()
+            val result = connectDeferred.await()
+            // Bug: the very first connect attempt (cold start, racing the
+            // Termux gateway process still booting) used to just dead-end
+            // here in Failed with nothing ever retrying — the caller
+            // (ChatViewModel/HermesGatewayService) got a Failed result and
+            // neither of them starts a retry loop of their own. The user
+            // then has to manually tap Retry or force-stop the app. A
+            // failed FIRST attempt is not meaningfully different from a
+            // MID-SESSION drop, so route it through the same self-healing
+            // backoff loop instead of leaving the connection parked dead.
+            if (result !is ConnectionState.Connected && result !is ConnectionState.Disconnected) {
+                reconnectJob?.cancel()
+                reconnectJob = scope.launch { reconnect() }
+            }
+            result
         } finally {
             if (pendingConnect === connectDeferred) pendingConnect = null
         }
@@ -278,9 +292,8 @@ class OkHttpGatewayClient @Inject constructor(
         pendingRequests.values.forEach { it.completeExceptionally(GatewayException("Disconnected: $reason")) }
         pendingRequests.clear()
 
-        if (_connectionState.value is ConnectionState.Disconnected ||
-            _connectionState.value is ConnectionState.Failed) {
-            return // User-initiated disconnect, don't reconnect
+        if (_connectionState.value is ConnectionState.Disconnected) {
+            return // User-initiated disconnect (the only state disconnect() sets), don't reconnect
         }
 
         reconnectJob?.cancel()
@@ -289,9 +302,17 @@ class OkHttpGatewayClient @Inject constructor(
 
     private suspend fun reconnect() {
         var attempt = 0
+        // Only Connected (success) or Disconnected (explicit user disconnect
+        // — the only place that sets it) should stop this loop. Failed is
+        // NOT a stop signal: doConnect() sets it after every unsuccessful
+        // attempt, including ones made BY this very loop. Treating it as
+        // terminal here used to kill the whole retry loop after exactly one
+        // failed attempt — the client would sit disconnected indefinitely
+        // until the user force-stopped the app or something else (e.g. a
+        // screen-off/on cycle recreating the process) happened to trigger a
+        // brand new connect() call from scratch.
         while (_connectionState.value !is ConnectionState.Connected &&
-            _connectionState.value !is ConnectionState.Disconnected &&
-            _connectionState.value !is ConnectionState.Failed) {
+            _connectionState.value !is ConnectionState.Disconnected) {
 
             attempt++
             val delayMs = min(MAX_RECONNECT_DELAY_MS, INITIAL_RECONNECT_DELAY_MS * (1L shl (attempt - 1)))
