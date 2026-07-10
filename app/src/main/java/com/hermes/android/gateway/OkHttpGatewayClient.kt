@@ -230,7 +230,17 @@ class OkHttpGatewayClient @Inject constructor(
 
         if (!ws.send(requestJson)) {
             pendingRequests.remove(id)
-            throw GatewayException("Failed to send WebSocket message")
+            // OkHttp's WebSocket returns false (no exception) both when the
+            // socket is closed/closing AND when enqueueing this message
+            // would push the outgoing buffer over its internal 16 MiB cap —
+            // there's no way to tell which from here, but a ~16 MiB+ JSON
+            // payload (a base64-encoded attachment, mainly) is the far more
+            // likely cause than a mid-request disconnect.
+            val sizeHint = if (requestJson.length > 8 * 1024 * 1024) {
+                " — payload is ${requestJson.length / (1024 * 1024)} MB, likely over " +
+                    "OkHttp's ~16 MiB WebSocket message limit"
+            } else ""
+            throw GatewayException("Failed to send WebSocket message$sizeHint")
         }
 
         return try {

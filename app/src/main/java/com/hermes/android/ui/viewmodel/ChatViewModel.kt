@@ -514,8 +514,19 @@ class ChatViewModel @Inject constructor(
     // ── Attachments — files/images travel over the loopback gateway only ──
     // (Termux keeps its sandbox: no shared-storage permission is involved.)
 
-    /** Max upload size; matches the gateway's image.attach_bytes cap (25 MB). */
-    private val maxAttachBytes = 25 * 1024 * 1024
+    // The attachment travels as ONE base64 string inside a single WebSocket
+    // text frame (there's no chunked-upload RPC — file.attach/
+    // image.attach_bytes both take the whole thing in one call). OkHttp's
+    // WebSocket silently refuses to even enqueue a frame once its outgoing
+    // buffer would exceed 16 MiB (RealWebSocket.send() just returns false,
+    // no exception, no server round-trip) — so the real ceiling isn't the
+    // 25 MB this used to advertise, it's whatever RAW size base64-encodes
+    // (×4/3) to under that 16 MiB frame limit. A 25 MB file becomes ~33 MB
+    // of base64 and never even reaches the network; it fails at
+    // `ws.send()` with an opaque "Failed to send WebSocket message", which
+    // is almost certainly what a large zip was hitting. Capped to a raw
+    // size that safely base64-encodes under the 16 MiB frame limit.
+    private val maxAttachBytes = 10 * 1024 * 1024
 
     /** Chunk size for streaming Base64 encoding (1 MB raw = ~1.33 MB b64). */
     private val attachChunkSize = 1024 * 1024
@@ -528,8 +539,10 @@ class ChatViewModel @Inject constructor(
      * referenced from the prompt via the returned `@file:` token).
      *
      * Uses chunked Base64 encoding to avoid loading the entire file +
-     * its b64 representation in RAM simultaneously (a 25 MB file would
-     * otherwise spike ~91 MB). Peak memory is now ~2.7 MB.
+     * its b64 representation in RAM simultaneously. Peak memory is ~2.7 MB
+     * regardless of file size — the encoding is streamed, only the final
+     * send is one shot (see maxAttachBytes for why that caps well below
+     * what this streaming approach could otherwise support).
      */
     fun attachFromUri(uri: Uri) {
         val sessionId = _uiState.value.activeSessionId ?: return
@@ -558,7 +571,10 @@ class ChatViewModel @Inject constructor(
                         if (read <= 0) break
                         totalSize += read
                         if (totalSize > maxAttachBytes) {
-                            throw IllegalStateException("File too large (max 25 MB)")
+                            throw IllegalStateException(
+                                "File too large (max 10 MB — larger files can't fit in a single " +
+                                    "WebSocket message once base64-encoded)"
+                            )
                         }
                         val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
                         b64.append(Base64.encodeToString(chunk, Base64.NO_WRAP))
