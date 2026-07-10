@@ -517,8 +517,21 @@ class ChatViewModel @Inject constructor(
     /** Max upload size; matches the gateway's image.attach_bytes cap (25 MB). */
     private val maxAttachBytes = 25 * 1024 * 1024
 
-    /** Chunk size for streaming Base64 encoding (1 MB raw = ~1.33 MB b64). */
-    private val attachChunkSize = 1024 * 1024
+    /**
+     * Chunk size for streaming Base64 encoding (~1 MB raw = ~1.33 MB b64).
+     *
+     * Bug: must be a multiple of 3. `Base64.encodeToString()` treats each
+     * chunk as a complete, standalone payload and pads it to a multiple of
+     * 4 output chars — so a chunk size that isn't a multiple of 3 (the old
+     * value, 1024*1024, leaves a remainder of 1) gets "==" padding inserted
+     * at the end of EVERY chunk except the last, not just the true end of
+     * the file. Concatenating those chunks produces base64 with "=" stuck
+     * in the middle of the string, which is invalid — the gateway's strict
+     * `base64.b64decode(..., validate=True)` rejects it as error 5028
+     * ("invalid data_url payload"). This reliably broke any non-image
+     * attachment over 1 MB (i.e. more than one chunk).
+     */
+    private val attachChunkSize = 1_048_575 // = 3 * 349_525
 
     /**
      * Upload a user-picked file to the gateway session.
