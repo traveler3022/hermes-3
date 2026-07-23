@@ -1,5 +1,8 @@
 package com.hermes.android.ui.screen
 
+import android.os.SystemClock
+import kotlinx.coroutines.delay
+
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
@@ -349,10 +352,11 @@ internal fun MessageBubble(
                             if (message.text.isEmpty()) {
                                 TypingDots(modifier = Modifier.padding(vertical = 4.dp))
                             } else {
+                                val throttledText = rememberStreamingThrottle(message.text, message.isStreaming)
                                 val displayMd = if (!isResponseExpanded && isLongResponse) {
-                                    message.text.take(800) + "\n\n…"
+                                    throttledText.take(800) + "\n\n…"
                                 } else {
-                                    message.text
+                                    throttledText
                                 }
                                 // Multi-format agent output: split into typed
                                 // blocks (text/image/code/mermaid/html/video/
@@ -845,3 +849,32 @@ internal fun MessageBubble(
 
 // ── Feature #16: Search highlight helper ─────────────────────────────────
 
+
+// ── Streaming text throttle ─────────────────────────────────────────────────
+// While the assistant reply streams in, the gateway can push a new token every
+// few milliseconds. Re-parsing the whole markdown (parseContentBlocks +
+// parseMarkdownBlocks) on every single token made Persian/RTL text reflow and
+// re-shape constantly — words jumped around or rendered stuck together mid-word.
+// Throttling the *displayed* text to ~12 updates/sec keeps streaming smooth and
+// readable; the complete text is always shown the instant streaming finishes.
+private const val STREAM_THROTTLE_MS = 80L
+
+@Composable
+private fun rememberStreamingThrottle(text: String, isStreaming: Boolean): String {
+    var displayed by remember { mutableStateOf(text) }
+    var lastEmitMs by remember { mutableStateOf(0L) }
+    LaunchedEffect(text, isStreaming) {
+        if (!isStreaming) {
+            // Complete (or historical) message: show the full text at once.
+            displayed = text
+            lastEmitMs = SystemClock.uptimeMillis()
+            return@LaunchedEffect
+        }
+        val now = SystemClock.uptimeMillis()
+        val wait = STREAM_THROTTLE_MS - (now - lastEmitMs)
+        if (wait > 0) delay(wait)
+        displayed = text
+        lastEmitMs = SystemClock.uptimeMillis()
+    }
+    return displayed
+}
